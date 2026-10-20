@@ -265,6 +265,8 @@ on the remote host, next to `ccswitch`):
 then **Developer: Reload Window**. It adds a sidebar icon and a status-bar item
 (`current work · 1/3 free · most headroom personal (10%/5%)`).
 
+<img src="vscode/screenshot.png" width="320" alt="VS Code sidebar: one card per ccswitch account with 5h and weekly usage bars, CURRENT and MOST HEADROOM badges, a re-login flag and the auto-switch toggle">
+
 - **Usage** — one card per saved account, read from `ccswitch`'s own usage
   cache (`~/.claude/accounts/<label>/.usage-cache`); the sidebar runs
   `ccswitch usage --no-switch` every 10 minutes (the cache TTL) to refresh it,
