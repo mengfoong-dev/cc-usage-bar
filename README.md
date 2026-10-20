@@ -274,7 +274,8 @@ then **Developer: Reload Window**. It adds a sidebar icon and a status-bar item
   (green to 59%, amber to 85%, red above). The account you are on is marked
   **CURRENT**, the one with the lowest `max(5h, weekly)` **MOST HEADROOM**.
 - **Switch** — click an account's name. It runs `ccswitch <label>`; open Claude
-  Code tabs in VS Code carry on as the new account.
+  Code sessions use the new account; restart open Claude Code tabs to move
+  them over (see Caveats).
 - **Save / delete** — **SAVE** appears on the current account's card when it is
   not saved yet (`ccswitch save` only ever snapshots the active login); the
   trash icon runs `ccswitch delete`. Both confirm first.

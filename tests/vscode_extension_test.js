@@ -47,7 +47,7 @@ const orig = Module._load;
 Module._load = function (r, ...a) { return r === 'vscode' ? vscode : orig.call(this, r, ...a); };
 const file = path.join(__dirname, '..', 'vscode', 'extension.js');
 const m = new Module(file); m.filename = file; m.paths = Module._nodeModulePaths(path.dirname(file));
-m._compile(fs.readFileSync(file, 'utf8') + '\n;Object.assign(module.exports, { readAccounts, activeLabel, autoTarget, checkLogins, relogin, switchSeat, saveSeat });', file);
+m._compile(fs.readFileSync(file, 'utf8') + '\n;Object.assign(module.exports, { readAccounts, activeLabel, autoTarget, checkLogins, relogin, switchSeat, saveSeat, esc, webviewHtml, popupDoc });', file);
 const e = m.exports;
 const calls = () => (fs.existsSync(LOG) ? fs.readFileSync(LOG, 'utf8').trim().split('\n') : []);
 
@@ -110,6 +110,28 @@ const calls = () => (fs.existsSync(LOG) ? fs.readFileSync(LOG, 'utf8').trim().sp
         assert.deepStrictEqual(calls(), []);
         await e.saveSeat('work', () => {});
         assert.deepStrictEqual(calls(), ['save work']);
+    });
+
+    await check('esc makes a label safe as HTML text and inside a quoted attribute', () => {
+        assert.strictEqual(e.esc('<img src=x onerror="a()">&\''), '&lt;img src=x onerror=&quot;a()&quot;&gt;&amp;&#39;');
+        assert.strictEqual(e.esc('work-2'), 'work-2');
+        assert.strictEqual(e.esc(42), '42');
+    });
+
+    await check('the webview locks itself down with a CSP and escapes every label it writes as HTML', () => {
+        const html = e.webviewHtml(e.popupDoc());
+        assert.match(html, /<meta http-equiv="Content-Security-Policy" content="default-src 'none'; [^"]*">/);
+        assert.ok(html.includes('function esc('), 'the page carries the same esc as the extension');
+        // every label/name that reaches innerHTML or an attribute string goes through esc()
+        assert.ok(html.includes("esc(cap.best.label)") && html.includes("Save your current login as ' + esc(name)")
+            && html.includes("Delete the saved login for ' + esc(name)"));
+        assert.ok(!/\+ cap\.best\.label \+|as ' \+ name \+|for ' \+ name \+/.test(html), 'no raw label in HTML strings');
+    });
+
+    await check('switch texts agree with ccswitch: open Claude Code tabs need a restart', () => {
+        const src = fs.readFileSync(file, 'utf8');
+        assert.ok(!/carry on as the new seat/.test(src), 'no hot-swap claim');
+        assert.match(src, /restart open Claude Code tabs/i);
     });
 
     console.log('----------------------------------------');

@@ -38,6 +38,12 @@ function readSnapshot() {
     return { generated_at: times.length ? Math.min(...times) : null, accounts };
 }
 
+// HTML-escape a label before it goes into innerHTML or a quoted attribute. Labels come from folder names, or from
+// a team file when claudeUsage.usageFile is set, so they are input. The webview gets this same function.
+function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 function resetText(epoch) {
@@ -168,13 +174,13 @@ async function switchSeat(label, onDone) {
     if (relogin.has(label) || !saved(label)) return enroll(label, relogin.has(label), onDone);
 
     const ok = await vscode.window.showWarningMessage(`Switch Claude Code to ${label}?`,
-        { modal: true, detail: 'Instant, using your saved login (ccswitch). Open Claude Code tabs carry on as the new seat.' },
+        { modal: true, detail: 'Instant, using your saved login (ccswitch). New Claude Code sessions use it; restart open Claude Code tabs to move them over.' },
         'Switch');
     if (ok !== 'Switch') return;
     const r = await ccswitch([label]);
     if (!r.ok) { vscode.window.showErrorMessage('ccswitch failed: ' + r.msg); return; }
     onDone();
-    vscode.window.showInformationMessage(`Switched Claude Code to ${label}.`);
+    vscode.window.showInformationMessage(`Switched Claude Code to ${label}. Restart open Claude Code tabs to use it.`);
 }
 
 // One-time enrolment of a seat ccswitch can't switch to yet: log in to it with Claude's /login, then SAVE.
@@ -273,7 +279,7 @@ function activate(context) {
         const r = await ccswitch([to]);
         if (!r.ok) { vscode.window.showErrorMessage(`Auto-switch to ${to} failed: ` + r.msg); return; }
         poll();
-        const next = await vscode.window.showWarningMessage(`Auto-switched Claude Code: ${from} is full, now on ${to} (most headroom).`, 'Turn auto-switch off');
+        const next = await vscode.window.showWarningMessage(`Auto-switched Claude Code: ${from} is full, now on ${to} (most headroom). Restart open Claude Code tabs to use it.`, 'Turn auto-switch off');
         if (next === 'Turn auto-switch off') vscode.workspace.getConfiguration('claudeUsage').update('autoSwitch', false, vscode.ConfigurationTarget.Global);
     };
     const toggleAuto = () => vscode.workspace.getConfiguration('claudeUsage').update('autoSwitch', !autoOn(), vscode.ConfigurationTarget.Global);
@@ -329,7 +335,10 @@ function activate(context) {
 
 // Same driver as ui/index.html, but the data arrives by postMessage instead of fetch.
 function webviewHtml(doc) {
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    // No network, no external files: inline script/style only (the srcdoc frames inherit this policy).
+    return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; frame-src 'self'">
+<style>
 body { margin: 0; padding: 8px 0; } #cap { color: #ccc; background: #1e1e1e; border-radius: 6px; padding: 7px 10px; margin-bottom: 6px; font: 12px system-ui, sans-serif; line-height: 1.5; }
 #cap .k { color: #888; font-size: 11px; font-weight: 600; letter-spacing: .05em; display: block; } #cap b { color: #fff; } #cap .hop { color: #57bdb2; } #cap .stale { color: #e05050; } #cap .k2 { color: #888; }
 #cap .head { display: flex; align-items: center; justify-content: space-between; gap: 6px; } #cap .head .k { display: inline; }
@@ -346,6 +355,7 @@ iframe.best { border-color: #238636; } iframe.cur { border-color: #D97757; }
 #cap .best { color: #3fb950; }
 </style></head><body><div id="cap"></div><div id="grid"></div><script>
 const DOC = ${JSON.stringify(doc).replace(/</g, '\\u003c')};
+${esc.toString()}
 const COLORS = { bg: '#1e1e1e', fg: '#cccccc', fg_dim: '#888888', fg_heading: '#ffffff', fg_link: '#D97757',
     bar_bg: '#333333', bar_fg: '#D97757', bar_fg_warn: '#F0443A', bar_divider: '#000c', bar_marker: '#fffc' };
 const T = { account: 'Account', email: 'Email', plan: 'Plan', usage: 'Usage', extra_usage: 'Extra usage',
@@ -368,7 +378,7 @@ function paint(name, data) {
     }
 }
 function tag(name) {
-    const w = frames[name], iframe = document.querySelector('iframe[data-name="' + name + '"]');
+    const w = frames[name], iframe = document.querySelector('iframe[data-name="' + CSS.escape(name) + '"]');
     if (!w || !iframe) return;
     const cur = lastCap.you === name, best = !!lastCap.best && lastCap.best.label === name;
     iframe.classList.toggle('cur', cur);
@@ -379,10 +389,10 @@ function tag(name) {
     // ccswitch actions: only for seats with an email (Claude seats) and when ccswitch is installed
     if (lastCap.saved && iframe.dataset.claude) {
         const isSaved = lastCap.saved.includes(name);
-        if (cur && !isSaved) b.insertAdjacentHTML('afterbegin', '<span class="act save" data-a="save" title="Save your current login as ' + name + ' so switching back is instant (ccswitch save)">SAVE</span>');
+        if (cur && !isSaved) b.insertAdjacentHTML('afterbegin', '<span class="act save" data-a="save" title="Save your current login as ' + esc(name) + ' so switching back is instant (ccswitch save)">SAVE</span>');
         const dead = (lastCap.relogin || []).includes(name);
         if (dead) b.insertAdjacentHTML('beforeend', '<span class="act relog" data-a="login" title="The saved login expired (ccswitch: re-login). Click for how to refresh it">re-login</span>');
-        else if (isSaved) b.insertAdjacentHTML('beforeend', '<span class="act del" data-a="del" aria-label="Delete saved login" title="Delete the saved login for ' + name + ' (ccswitch delete)">' + TRASH + '</span>');
+        else if (isSaved) b.insertAdjacentHTML('beforeend', '<span class="act del" data-a="del" aria-label="Delete saved login" title="Delete the saved login for ' + esc(name) + ' (ccswitch delete)">' + TRASH + '</span>');
         else if (!cur) b.insertAdjacentHTML('beforeend', '<span class="dim" title="Not saved in ccswitch yet - click the seat name for the one-time steps">not saved</span>');
         for (const el of b.querySelectorAll('[data-a]')) el.onclick = () => vsc.postMessage({ [el.dataset.a === 'login' ? 'seat' : el.dataset.a]: name });
     }
@@ -414,7 +424,7 @@ const ago = (t) => { const m = Math.round((Date.now() / 1000 - t) / 60); return 
 let infoOpen = false, last = null;
 const EXPLAIN = 'When your seat hits <b>100%</b> (5h or weekly), switch to the seat with the <b>most headroom</b> '
     + 'automatically. Saved seats only, fresh usage data only, never to a full seat, at most once per 10 min. '
-    + 'Open Claude Code tabs carry on as the new seat. Only your own login changes.';
+    + 'New Claude Code sessions use the new seat; restart open Claude Code tabs to move them over. Only your own login changes.';
 const render = () => last && onData(last);
 window.addEventListener('message', ({ data }) => { last = data; onData(data); });
 function onData({ accounts, cap }) {
@@ -428,7 +438,7 @@ function onData({ accounts, cap }) {
         + '</div>'
         + (cap.saved && infoOpen ? '<div class="explain">' + EXPLAIN + '</div>' : '')
         + '<b>' + cap.free + '/' + cap.total + '</b> seats free'
-        + (cap.best ? ' · most headroom <b class="best">' + cap.best.label + '</b> 5H ' + r(cap.best.five) + ' · WK ' + r(cap.best.week) : '')
+        + (cap.best ? ' · most headroom <b class="best">' + esc(cap.best.label) + '</b> 5H ' + r(cap.best.five) + ' · WK ' + r(cap.best.week) : '')
         + (cap.updated ? ' · <span class="' + (cap.stale ? 'stale' : 'k2') + '">updated ' + ago(cap.updated) + '</span>' : '');
     const auto = document.getElementById('auto'), info = document.getElementById('info');
     const key = (fn) => (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(); } };
