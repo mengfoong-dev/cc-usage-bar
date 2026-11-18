@@ -41,7 +41,7 @@ run(async () => {
         const det = html.slice(html.indexOf('<div class="det">'), html.indexOf('data-l="004"'));
         assert.ok(det.includes('Session (5hr) · last 24h') && det.includes('Weekly (7 day) · last 7d') && det.includes('24h ago') && det.includes('7d ago'));
         const session = det.slice(0, det.indexOf('Weekly (7 day)'));
-        assert.strictEqual(session.split('<polyline').length - 1, 2, 'two windows, two lines');
+        assert.strictEqual(session.split('<polyline class="ln').length - 1, 2, 'two windows, two lines (plus their orange copy)');
         assert.strictEqual(session.split('class="rz"').length - 1, 1, 'one tick where the new window starts');
         assert.match(session, /Full in 2h (19|20)m at this pace/);
         assert.match(det, /class="g80" x1="0" x2="300" y1="11\.2"/, 'the 80% guide');
@@ -52,7 +52,7 @@ run(async () => {
         assert.ok(!p.render(d, ui({ view: 'history', histOpen: null })).includes('<svg'), 'all closed');
         const jit = withHist([pt(2400, 10, 50, now + 4 * 3600), pt(1200, 20, 50, now + 4 * 3600 + 1), pt(0, 30, 50, now + 4 * 3600 - 1)]);
         const js = p.render(jit, ui({ view: 'history' }));
-        assert.strictEqual(js.slice(0, js.indexOf('Weekly (7 day)')).split('<polyline').length - 1, 1, 'reset times a second apart: one line');
+        assert.strictEqual(js.slice(0, js.indexOf('Weekly (7 day)')).split('<polyline class="ln').length - 1, 1, 'reset times a second apart: one line');
     });
 
     await check('hover: tooltip text from a known series: time ago + clock, usage %, rate in %/h (5h) and %/day (weekly), reset, no data', () => {
@@ -62,7 +62,7 @@ run(async () => {
         assert.deepStrictEqual({ ...p.hoverAt(five, t0 + 250) }, { when: '2h 55m ago \u00b7 ' + clock(t0 + 250), pct: '10%', rate: '+12.0%/h' }, '2 points in 10 min = +12.0%/h');
         assert.strictEqual(p.hoverAt(five, t0 + 900).rate, '+15.0%/h', 'trailing hour, cut at the window start: 10 -> 15 in 20 min');
         assert.strictEqual(p.hoverAt(five, t0 + 1500).rate, 'reset', 'usage falls 15 -> 3: a reset, not a negative rate');
-        assert.strictEqual(p.hoverAt(five, t0 + 3000).rate, 'no data', 'the 1 h gap is longer than 3x the 10 min spacing');
+        assert.strictEqual(p.hoverAt(five, t0 + 3000).rate, 'avg +7.0%/h over 1h (no samples)', 'the 1 h gap is longer than 3x the 10 min spacing: a hole, the rise across it averaged');
         assert.strictEqual(p.hoverAt(five, now).rate, 'no data', 'after the last sample');
         assert.strictEqual(p.hoverAt(five, now).pct, '\u2013', 'and no % either: the nearest sample is too far');
         assert.strictEqual(p.hoverAt(five, now - 30).when.split(' \u00b7 ')[0], 'just now');
@@ -74,6 +74,50 @@ run(async () => {
         assert.strictEqual(p.hoverAt(week, d2 + 5400).rate, '+18.0%/day', 'trailing day, cut at the window start: 40 -> 41.5 in 2 h');
         assert.ok(/^1d 23h ago \u00b7 (Sun|Mon|Tue|Wed|Thu|Fri|Sat) \d\d:\d\d$/.test(w.when), w.when + ': a day or more back adds the weekday');
         assert.strictEqual(w.pct, '40%');
+    });
+
+    await check('holes: the chart draws a hole dashed (.ln.gap) and the hover averages over it; a fall or new window across it stays a reset', () => {
+        const p = panel(), t0 = now - 20 * 3600, R = now + 3600, R2 = now + 9000;
+        // 10-min samples, then a 14 h hole (10 -> 24), then samples again.
+        const pts = [[t0, 10, R], [t0 + 600, 11, R], [t0 + 1200, 12, R], [t0 + 1800, 13, R], [t0 + 1800 + 14 * 3600, 24, R], [t0 + 2400 + 14 * 3600, 25, R]];
+        const html = p.chart('Session (5h)', pts, now - 86400, now, '24h ago', null, 25, 'five', 'a');
+        assert.strictEqual(html.split('<polyline class="ln').length - 1, 3, 'solid, dashed hole, solid (plus their orange copy)');
+        assert.strictEqual(html.split('<polyline class="ln gap"').length - 1, 1, 'one dashed piece');
+        assert.ok(html.indexOf('class="ln gap"') > html.indexOf('<polyline class="ln"'), 'the dashed piece sits between the solid ones');
+        assert.ok(/\.ch \.ln\.gap \{[^}]*stroke-dasharray/.test(readWv('panel.css')), 'the css dashes it');
+        assert.ok(!p.chart('x', pts.slice(0, 4), now - 86400, now, '', null, 13, 'five', 'a').includes('ln gap'), 'no hole, no dashes');
+        // A hole across a window change: the line breaks (resets as before), no dashed piece.
+        assert.ok(!p.chart('x', [pts[0], pts[1], pts[2], [pts[4][0], 3, R2], pts[5]], now - 86400, now, '', null, 4, 'five', 'a').includes('ln gap'));
+        const five = { kind: 'five', from: now - 86400, to: now, pts };
+        assert.strictEqual(p.hoverAt(five, t0 + 7 * 3600).rate, 'avg +0.8%/h over 14h (no samples)');
+        assert.strictEqual(p.hoverAt({ ...five, pts: [pts[0], pts[1], pts[2], [pts[4][0], 3, R], pts[5]] }, t0 + 7 * 3600).rate, 'reset', 'a fall across the hole');
+        assert.strictEqual(p.hoverAt({ ...five, pts: [pts[0], pts[1], pts[2], [pts[4][0], 30, R2], pts[5]] }, t0 + 7 * 3600).rate, 'reset', 'a new window across the hole');
+        assert.strictEqual(p.hoverAt(five, now).rate, 'no data', 'outside the data');
+        const d = 86400, w0 = now - 6 * d, wk = [[w0, 10, R], [w0 + 3600, 11, R], [w0 + 7200, 12, R], [w0 + 10800, 13, R], [w0 + 10800 + 2 * d + 3 * 3600, 25, R], [w0 + 14400 + 2 * d + 3 * 3600, 26, R]];
+        assert.strictEqual(p.hoverAt({ kind: 'week', from: now - 7 * d, to: now, pts: wk }, w0 + d).rate, 'avg +5.6%/day over 2d 3h (no samples)', 'weekly: %/day, a length in days and hours');
+        assert.strictEqual(p.hoverAt({ kind: 'five', from: now - d, to: now, pts: [[t0, 10, R], [t0 + 600, 11, R], [t0 + 1200, 12, R], [t0 + 1200 + 2700, 15, R]] }, t0 + 2500).rate, 'avg +4.0%/h over 45m (no samples)', 'minutes');
+    });
+
+    await check('holes: few points still find the hole (lower median), and a downsampled 7d / 30d range dashes only holes over 3 columns', () => {
+        const p = panel(), R = now + 3600, hole = (n) => n * 3600;
+        // 3 samples: 10 min, then a 14 h hole. The upper median would be the hole itself.
+        const t0 = now - 20 * 3600, three = [[t0, 10, R], [t0 + 600, 11, R], [t0 + 600 + hole(14), 18, R]];
+        assert.strictEqual(p.chart('x', three, now - 86400, now, '', null, 18, 'five', 'a').split('<polyline class="ln gap"').length - 1, 1, 'dashed');
+        assert.strictEqual(p.hoverAt({ kind: 'five', from: now - 86400, to: now, pts: three }, t0 + hole(7)).rate, 'avg +0.5%/h over 14h (no samples)');
+        // A series of 10-min samples with a hole in the middle, more points than the 300 columns, so it is downsampled.
+        const series = (days, holeH) => {
+            const a = now - days * 86400, n = Math.floor((days * 86400 - hole(holeH)) / 1200) - 1, pts = [];
+            let v = 0;
+            for (let i = 0; i < n; i++) pts.push([a + i * 600, (v += 0.01), R]);
+            const b = a + (n - 1) * 600 + hole(holeH);
+            for (let i = 0; i < n; i++) pts.push([b + i * 600, (v += 0.01), R]);
+            return pts;
+        };
+        const dashes = (days, holeH) => p.chart('x', series(days, holeH), now - days * 86400, now, '', null, 10, 'week', 'a').split('<polyline class="ln gap"').length - 1;
+        assert.strictEqual(dashes(7, 12), 1, '7d: a column is 34 min, a 12 h hole is dashed');
+        assert.strictEqual(dashes(7, 1), 0, '7d: a 1 h gap is under 3 columns');
+        assert.strictEqual(dashes(30, 10), 1, '30d: a column is 2.4 h, a 10 h hole (over 7.2 h) is dashed');
+        assert.strictEqual(dashes(30, 5), 0, '30d: a 5 h hole is under 3 columns, not dashed');
     });
 
     await check('hover: the rate is taken over a trailing window (1 h on 5h, 24 h on weekly), so whole-number steps do not swing it (review finding)', () => {
@@ -229,8 +273,10 @@ run(async () => {
         const series = Array.from({ length: N }, (_, i) => [from + i * 600, 10 + (i % 50) / 2, now + 4 * 3600]);
         const big = { ...d, histRange: '30d', history: [{ ...d.history[0], fiveSeries: series, weekSeries: series }] };
         const html = p.render(big, ui({ view: 'history', histRange: '30d' }));
-        const total = (html.match(/points="[^"]*"/g) || []).join(' ').split(' ').length;
+        const count = (re) => [...html.matchAll(re)].map((m) => m[1]).join(' ').split(' ').length;
+        const total = count(/<polyline class="ln[^"]*" points="([^"]*)"/g);  // the blue lines; the orange copy repeats them once
         assert.ok(total < 2 * N / 5, 'drawn points: ' + total + ' (raw ' + 2 * N + ')');
+        assert.strictEqual(count(/<polyline class="up ln[^"]*" points="([^"]*)"/g), total, 'the clipped orange copy has the same points');
     });
 
     await check('layout: List is the default (rows that expand); Grid shows every account\'s two charts at once, with hover and range', () => {
@@ -270,5 +316,10 @@ run(async () => {
         assert.ok(!html.includes('<img src=x') && !html.includes('<b>') && html.includes('&lt;b&gt;'));
         assert.match(html, /<div class="ch hi"><div class="top"><span>Session/, '85% now: orange line');
         assert.match(html, /<polyline class="ln" points="297\.0,8\.4 300\.0,8\.4"\/>/, 'a lone point is a short dash that ends at "now", inside the chart');
+        // Colour by value: one orange copy of the lines, clipped to the band above the 80% guide (same y as .g80).
+        const g80 = html.match(/class="g80" x1="0" x2="\d+" y1="([\d.]+)"/)[1];
+        assert.match(html, new RegExp('<clipPath id="hu(\\d+)"><rect x="0" y="0" width="\\d+" height="' + g80.replace('.', '\\.') + '"/></clipPath><g class="lns">[^]*</g><g class="lns up" clip-path="url\\(#hu\\1\\)">[^]*<polyline class="up ln" points="297\\.0,8\\.4 300\\.0,8\\.4"/>'));
+        const css = readWv('panel.css');
+        assert.ok(!/\.ch\.hi \.ln/.test(css) && !/\.ch \.ln \{[^}]*stroke:/.test(css) && /\.ch g\.lns\.up \{ stroke: var\(--vscode-charts-orange\)/.test(css), 'the whole line no longer turns orange; only the part above 80%');
     });
 });

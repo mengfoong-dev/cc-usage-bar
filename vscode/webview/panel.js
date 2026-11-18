@@ -74,8 +74,13 @@ function automation(d, ui) {
     return section('automation', 'Automation', open, '<span class="r">' + (d.auto ? 'On' : 'Off') + '</span>')
         + (open ? '<div class="kv"><span>Auto-switch at 100%</span>'
             + '<button class="tg' + (d.auto ? ' on' : '') + '" data-a="auto" role="switch" aria-checked="' + !!d.auto + '" aria-label="Auto-switch at 100%"'
-            + ' title="When the active account reaches 100%, switch to the next-best account (fresh data, working login, at most once per 10 min), without asking. Restart open Claude Code tabs to use it."></button></div>'
-            + '<div class="note">Moves every new Claude Code session on this machine to the account in "If you run out". Asks once when you turn it on.</div>' : '');
+            + ' title="When the active account reaches 100%, switch to the next-best account (fresh data, working login, at most once per 10 min), without asking. Open Claude Code tabs use it from their next message."></button></div>'
+            + '<div class="note">Moves every new Claude Code session on this machine to the account in "If you run out". Asks once when you turn it on.</div>'
+            + (d.schedule ? '<div class="kv"><span>Keep history when VS Code is closed</span>'
+                + '<button class="tg' + (d.schedule.on ? ' on' : '') + '" data-a="sched" role="switch" aria-checked="' + !!d.schedule.on + '" aria-label="Keep history when VS Code is closed"'
+                + ' title="Adds one line to your crontab that reads usage every ' + (d.schedule.every || 10) + ' minutes while VS Code is closed (ccswitch schedule). Turn it off to remove the line."></button></div>'
+                + '<div class="note">' + (d.schedule.on ? 'On: a cron job samples usage every ' + (d.schedule.every || '?') + ' min, so the History charts have no gaps while VS Code is closed.'
+                    : 'Off: History has gaps while VS Code is closed. Turning this on adds one line to your crontab.') + '</div>' : '') : '');
 }
 
 // One limit over time: an SVG line from `from` to `to` (epoch s), 0-100%, with a dashed 80% guide. A new window (the
@@ -86,23 +91,46 @@ let CHARTS = [];
 // A chart's identity across repaints: account, limit and span (from/to move on with every poll). null = no such chart.
 function chartKey(cid) { const s = CHARTS[+cid]; return s ? s.label + '|' + s.kind + '|' + (s.to - s.from) : null; }
 const newWindow = (a, b) => a !== b && !(a != null && b != null && Math.abs(a - b) <= 60);  // reset times a second apart: one window
+// A hole: a segment between two samples longer than 3x the median spacing (no sample was taken, e.g. VS Code was closed).
+// The chart draws it dashed and hoverAt averages over it, so both use this one limit (seconds; Infinity under 2 points).
+// The lower median, so with few points one long hole is not the median itself.
+function holeGap(pts) {
+    const dts = pts.slice(1).map((q, i) => q[0] - pts[i][0]).sort((a, b) => a - b);
+    return dts.length ? 3 * dts[(dts.length - 1) >> 1] : Infinity;
+}
 function chart(title, pts, from, to, ago, pace, now, kind, label) {
     const x = (t) => ((t - from) / (to - from) * CW).toFixed(1);
     const y = (p) => (CH - Math.max(0, Math.min(100, p)) / 100 * CH).toFixed(1);
     pts = downsample(pts, from, to, CW);
     const runs = [];
     pts.forEach((q, i) => { const b = pts[i - 1]; if (!b || newWindow(q[2], b[2]) || q[1] < b[1]) runs.push([]); runs[runs.length - 1].push(q); });
+    const gap = holeGap(pts), xyOf = (q) => x(q[0]) + ',' + y(q[1]);
     const svg = runs.map((run, i) => {
-        const xy = run.map((q) => x(q[0]) + ',' + y(q[1]));
-        if (xy.length === 1) xy.unshift(Math.max(0, x(run[0][0]) - 3).toFixed(1) + ',' + y(run[0][1]));  // a lone point: a short dash, inside the chart
+        // Solid pieces, with a dashed piece (.gap) over each hole inside the run.
+        const parts = [];
+        let cur = [run[0]];
+        const flush = () => { if (cur.length > 1 || run.length === 1) parts.push([cur, '']); };
+        run.slice(1).forEach((q) => {
+            const b = cur[cur.length - 1];
+            if (q[0] - b[0] > gap) { flush(); parts.push([[b, q], ' gap']); cur = [q]; } else cur.push(q);
+        });
+        flush();
         return (i ? '<line class="rz" x1="' + x(run[0][0]) + '" x2="' + x(run[0][0]) + '" y1="0" y2="' + CH + '"/>' : '')
-            + '<polyline class="ln" points="' + xy.join(' ') + '"/>';
+            + parts.map(([ps, cls]) => {
+                const xy = ps.map(xyOf);
+                if (xy.length === 1) xy.unshift(Math.max(0, x(ps[0][0]) - 3).toFixed(1) + ',' + y(ps[0][1]));  // a lone point: a short dash, inside the chart
+                return '<polyline class="ln' + cls + '" points="' + xy.join(' ') + '"/>';
+            }).join('');
     }).join('');
     const cid = CHARTS.push({ pts, from, to, kind, label }) - 1;
     return '<div class="ch' + (now >= HIGH ? ' hi' : '') + '"><div class="top"><span>' + title + '</span><span class="p">' + pctText(now) + '</span></div>'
         + '<svg viewBox="0 0 ' + CW + ' ' + CH + '" data-cid="' + cid + '" preserveAspectRatio="none" role="img" aria-label="' + title + ', ' + pts.length + ' points">'
         + '<line class="g80" x1="0" x2="' + CW + '" y1="' + y(HIGH) + '" y2="' + y(HIGH) + '"/>'
-        + '<line class="base" x1="0" x2="' + CW + '" y1="' + CH + '" y2="' + CH + '"/>' + svg
+        + '<line class="base" x1="0" x2="' + CW + '" y1="' + CH + '" y2="' + CH + '"/>'
+        // Colour by value: the lines are drawn once in blue, then again in orange clipped to the band above the 80% guide,
+        // so only the part of a line at 80% or more is orange. The copy holds only the lines (no reset ticks); its pieces carry .up as well.
+        + '<clipPath id="hu' + cid + '"><rect x="0" y="0" width="' + CW + '" height="' + y(HIGH) + '"/></clipPath>'
+        + '<g class="lns">' + svg + '</g><g class="lns up" clip-path="url(#hu' + cid + ')">' + svg.replace(/<line class="rz"[^>]*\/>/g, '').replace(/class="ln/g, 'class="up ln') + '</g>'
         + '<line class="gl" x1="0" x2="0" y1="0" y2="' + CH + '"/></svg><div class="tip" role="presentation"></div>'
         + '<div class="ax"><span>' + ago + '</span><span>now</span></div>'
         + (pace ? '<div class="rs">' + esc(pace) + '</div>' : '') + '</div>';
@@ -128,14 +156,16 @@ function downsample(pts, from, to, cols) {
 // sample, and the rate up to the end of the segment around t (%/h for the 5h chart, %/day for the weekly one), taken
 // over a trailing RATE_SPAN (1 h / 24 h, cut at the window start): percents come in whole-number steps, so one 10-min
 // segment alone jumps between 0 and +6%/h. A fall in usage or a new window is a "reset", not a negative rate; a
-// segment longer than 3x the usual sample spacing, or t outside the data, is "no data". Pure, so the tests can call it.
+// segment longer than 3x the usual sample spacing (a hole, see holeGap) in one window is "avg +X%/h over 14h (no samples)":
+// the rise across the hole averaged. t outside the data is "no data". Pure, so the tests can call it.
+// A length in seconds: '45m', '14h', '2d 3h'.
+const spanText = (s) => { const m = Math.round(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24); return d ? d + 'd' + (h % 24 ? ' ' + (h % 24) + 'h' : '') : h ? h + 'h' : m + 'm'; };
 const RATE_SPAN = { five: 3600, week: 86400 };
 const startsWindow = (q, b) => q[1] < b[1] || newWindow(q[2], b[2]);  // q follows b
 function hoverAt(spec, t) {
     const pts = spec.pts;
     if (!pts.length) return null;
-    const dts = pts.slice(1).map((q, i) => q[0] - pts[i][0]).sort((a, b) => a - b);
-    const gap = dts.length ? 3 * dts[Math.floor(dts.length / 2)] : Infinity;
+    const gap = holeGap(pts);
     let i = 0;
     pts.forEach((q, k) => { if (Math.abs(q[0] - t) < Math.abs(pts[i][0] - t)) i = k; });
     const j = pts.findIndex((q, k) => k < pts.length - 1 && q[0] <= t && t <= pts[k + 1][0]);
@@ -147,7 +177,7 @@ function hoverAt(spec, t) {
             let k = j;
             while (k > 0 && pts[k - 1][0] >= b[0] - (RATE_SPAN[spec.kind] || RATE_SPAN.five) && !startsWindow(pts[k], pts[k - 1])) k--;
             rate = '+' + ((b[1] - pts[k][1]) / (b[0] - pts[k][0]) * (week ? 86400 : 3600)).toFixed(1) + (week ? '%/day' : '%/h');
-        }
+        } else if (dt > 0) rate = 'avg +' + ((b[1] - a[1]) / dt * (week ? 86400 : 3600)).toFixed(1) + (week ? '%/day' : '%/h') + ' over ' + spanText(dt) + ' (no samples)';
     }
     const s = Math.max(0, Math.round(spec.to - t)), m = Math.floor(s / 60), h = Math.floor(m / 60), dd = Math.floor(h / 24);
     const agoText = s < 60 ? 'just now' : (dd ? dd + 'd ' + (h % 24) + 'h' : h ? h + 'h ' + (m % 60) + 'm' : m + 'm') + ' ago';
@@ -337,6 +367,7 @@ if (typeof acquireVsCodeApi === 'function') {
         else if (a === 'save') return vsc.postMessage({ save: l });
         else if (a === 'delete') return vsc.postMessage({ del: l });
         else if (a === 'auto') return vsc.postMessage({ toggleAuto: 1 });
+        else if (a === 'sched') return vsc.postMessage({ toggleSchedule: 1 });
         else if (a === 'install') return vsc.postMessage({ installCc: 1 });
         vsc.setState(ui);
         paint();

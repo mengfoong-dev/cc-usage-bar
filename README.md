@@ -97,6 +97,7 @@ To wire up the statusLine by hand instead, merge this into
 Removes the two scripts from `~/.claude`, the `~/.local/bin/ccswitch` symlink,
 and the `statusLine` entry from `settings.json` — each only if it is still
 ours, so a `statusLine` you have since repointed at your own script survives.
+If you turned on `ccswitch schedule`, it also removes that one crontab line (no other line).
 Your saved accounts under `~/.claude/accounts/` are **kept**: they are live
 OAuth credentials that exist nowhere else. Add `--purge-accounts` to delete
 them too (it asks first). `--print-only` shows what it would do.
@@ -182,9 +183,36 @@ ccswitch version             print the version (also --version, -V)
 ccswitch help                show the full command guide (also -h, --help)
 ```
 
-Switching **requires restarting Claude Code** — see Caveats below. If you
-accepted the `ccw` shell function during install, `ccw <label>` is shorthand
-for `ccswitch <label> --relaunch`.
+`ccswitch <label>` takes effect on the next message: running Claude Code
+sessions, in a terminal or in VS Code, pick up the new login without a
+restart (see Caveats below). If you accepted the `ccw` shell function during
+install, `ccw <label>` is optional shorthand for `ccswitch <label> --relaunch`
+(switch, then start `claude`).
+
+### Keep history when VS Code is closed (opt-in)
+
+The VS Code extension fetches usage only while VS Code is open, so the usage
+history has holes whenever it is closed. `ccswitch schedule on` fills them: it adds
+**one** crontab line, marked `# ccswitch-schedule`, that takes one live sample
+every `--every <min>` minutes (5 to 60, default 10). It is off until you turn it
+on, and it is not a daemon.
+
+```
+*/10 * * * * PATH='<dirs of jq, curl, node>:/usr/local/bin:/usr/bin:/bin' '<abs path>/ccswitch' schedule tick 10 # ccswitch-schedule
+```
+
+- `on` replaces an existing marked line; `off` removes only that line. Every
+  other line of your crontab stays as it was.
+- `schedule tick <min>` is the cron job: one `usage --json` run with stdout
+  dropped and stderr appended to `~/.claude/ccswitch-schedule.log` (kept to the last
+  200 lines). It fetches only when the cache is older than `<min>*60-60` seconds, so it
+  does not double a fetch VS Code made a minute ago, and a run a second early is not lost.
+- Cron has a minimal `PATH`, so `on` writes the directories of `jq`, `curl` and
+  `node` as found when you run it. Run `on` again after moving them.
+- Exit codes: 0 ok (`status` exits 0 whether on or off); 1 bad arguments;
+  2 no `crontab` command, `crontab -l` failed (your crontab is left alone), or crontab refused the write.
+- `status --json` prints `{"on":true,"every":10}`; the VS Code Automation section
+  uses it for the "Keep history when VS Code is closed" toggle, which asks once in a dialog each time you turn it on.
 
 ## Usage — the monitor
 
@@ -224,7 +252,7 @@ Flags:
 - `--no-switch` — print the table and exit; skip the switch prompt.
 - `--refresh` — bypass the 10-minute usage cache and poll live.
 - `--relaunch` — if you do switch from the prompt, exec `claude` afterward
-  (same behavior as `ccswitch <label> --relaunch`).
+  (optional; same behavior as `ccswitch <label> --relaunch`).
 
 ### The Codex row
 
@@ -347,8 +375,8 @@ bottom:
 - **If you run out** — the best account to switch to: the lowest
   `max(5h, weekly)` among saved accounts with a working login, data under 15
   minutes old and both windows below 100%. **Switch** runs `ccswitch <label>`;
-  new Claude Code sessions use it; restart open Claude Code tabs to move them
-  over (see Caveats). With no such account it says **No account to switch to**.
+  open and new Claude Code sessions use it from their next
+  message (see Caveats). With no such account it says **No account to switch to**.
 - **Accounts** — the header says how many are saved (`4 saved`). Each row has
   one status icon, the name and one summary: `82% · 74%` (session · weekly),
   `Weekly full · resets Thu`, `Re-login needed` or `No recent data`. Click a
@@ -368,10 +396,9 @@ bottom:
   that says so, and VS Code records your answer on this machine. Auto-switch
   never acts without that answer: if the setting is on from Settings,
   settings.json or an older version, the sidebar shows the same dialog once, and
-  **No** turns the setting off. Turning it off needs no dialog. It applies to every new Claude Code session
-  on this machine (the setting is machine-scoped, so Settings Sync never carries
-  it to another machine). Open Claude Code tabs keep the old account until
-  restarted. It acts only after a login check since VS Code started that could
+  **No** turns the setting off. Turning it off needs no dialog. It applies to every Claude Code session
+  on this machine, open or new, from its next message (the setting is
+  machine-scoped, so Settings Sync never carries it to another machine). It acts only after a login check since VS Code started that could
   judge dead logins (`login_health` `known`), and never when the active
   account's own data is over 15 minutes old. Right before it runs `ccswitch`, it
   reads the live account again and stops unless that account is still the full
@@ -457,10 +484,14 @@ To change it: edit `vscode/`, bump `version` in `vscode/package.json`, run
 
 ## Caveats / honest limitations
 
-- **Switching requires restarting Claude Code.** A running session caches
-  its auth in memory, so there's no hot-swap — `ccswitch <label>` swaps the
-  credential files on disk, but the change only takes effect the next time
-  Claude Code starts (which is what `--relaunch` / `ccw` automate).
+- **Switching applies to open sessions from their next message.**
+  `ccswitch <label>` replaces `~/.claude/.credentials.json` and the
+  `oauthAccount` block in `~/.claude.json`. Claude Code (checked on 2.1.312)
+  checks the credentials file before each API request and re-reads it when it
+  changed, so no restart is needed. A reply that is already streaming finishes
+  on the old account. The shown account (`/status`, the VS Code panel)
+  follows within a few seconds. If `CLAUDE_CODE_OAUTH_TOKEN` or
+  `ANTHROPIC_API_KEY` is set, Claude Code uses that and ignores the switch.
 - **The usage monitor uses an undocumented Anthropic OAuth endpoint.**
   `ccswitch usage` was built by reverse-engineering third-party projects,
   not from published API docs. It may break on a future Claude Code/Claude.ai
