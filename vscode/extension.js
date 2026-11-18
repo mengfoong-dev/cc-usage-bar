@@ -110,22 +110,42 @@ function withHistory(accounts, want, now) {
     return accounts.map((a) => (isClaude(a) && want(a.label) && saved(a.label) ? { ...a, history: readHistory(a.label, now) } : a));
 }
 
-// "At this pace": the rise of one limit since its window started (the points that share the latest reset time),
-// extended in a straight line. Needs 20 min of points, a rise, and a last point under 30 min old. Returns { full: epoch }
-// when the limit would reach 100% before it resets, { lasts: true } when it would not, null when there is nothing to judge.
-// Reset times within a minute are one window (the API's reset time can move across a second boundary).
+// "At this pace": one limit's rise, extended in a straight line from the last point. The rate is the recent slope:
+// a least-squares line over the points of the current window (the latest reset time) in the recent span (5h limit: the
+// last 60 min, weekly: the last 24 h), when that span has 3+ points covering 20 min (weekly: 6 h); the API gives whole
+// percents, so a first-to-last slope jumps. A flat recent slope means { lasts: true }. Else the window average: needs
+// 20 min of points since the window's first sample and a rise. The last point must be under 30 min old.
+// Returns { full: epoch } when the limit would reach 100% before it resets, { lasts: true } when it would not,
+// null when there is nothing to judge. Reset times within a minute are one window (the API's reset time can move
+// across a second boundary).
 const PACE_MIN_SECS = 1200;
+const PACE_RECENT = { p5: [3600, 1200], p7: [86400, 21600] };  // [span, least covered] in seconds
 const sameWindow = (a, b) => a != null && b != null && Math.abs(a - b) <= 60;
 // Points that are not finite numbers (a hand-edited file) give null; it never throws.
 const usable = (x, p, r) => !!x && fin(x.t) && fin(x[p]) && fin(x[r]);
+// Least-squares slope of percent per second.
+function slope(pts, p) {
+    const n = pts.length, mt = pts.reduce((s, x) => s + x.t, 0) / n, mp = pts.reduce((s, x) => s + x[p], 0) / n;
+    const den = pts.reduce((s, x) => s + (x.t - mt) ** 2, 0);
+    return den ? pts.reduce((s, x) => s + (x.t - mt) * (x[p] - mp), 0) / den : 0;
+}
 function forecast(points, p, r, now) {
     const last = points[points.length - 1];
     if (!usable(last, p, r) || last[r] <= now || now - last.t > FRESH_SECS) return null;
     if (last[p] >= 100) return null;  // already full: the bar says so
-    const first = points.find((x) => usable(x, p, r) && sameWindow(x[r], last[r]));
-    const span = last.t - first.t, rise = last[p] - first[p];
-    if (span < PACE_MIN_SECS || rise <= 0) return null;
-    const full = last.t + (100 - last[p]) * span / rise;
+    const win = points.filter((x) => usable(x, p, r) && sameWindow(x[r], last[r]));
+    const [span, cover] = PACE_RECENT[p] || PACE_RECENT.p5;
+    const recent = win.filter((x) => x.t >= last.t - span);
+    let rate;  // percent per second
+    if (recent.length >= 3 && last.t - recent[0].t >= cover) {
+        rate = slope(recent, p);
+        if (!(rate > 0)) return { lasts: true };  // not rising at the recent pace
+    } else {
+        const first = win[0], secs = last.t - first.t, rise = last[p] - first[p];
+        if (secs < PACE_MIN_SECS || rise <= 0) return null;
+        rate = rise / secs;
+    }
+    const full = last.t + (100 - last[p]) / rate;
     if (!fin(full) || full <= now) return null;  // the line says it is full already, but no fetch saw it
     return full < last[r] ? { full } : { lasts: true };
 }
@@ -197,27 +217,52 @@ function autoTarget(cap) {
     return isLabel(cap.best.label) ? cap.best.label : null;
 }
 
-// Status bar: `● <you> <5h>%/<wk>% · ⇄ <next-best>`. ◷ marks data that is not fresh; $(sync) marks auto-switch on.
+// Status bar: `● <you> <5h>%/<wk>% · ⇄ <next-best>`. ◷ marks data that is not fresh; $(sync) marks auto-switch on; $(refresh~spin), the reload button's icon, marks a fetch running.
 // Only the best qualifying account is named, so a stale or dead account is never counted as available.
 const pctOr = (v) => (v == null ? '–' : Math.round(v) + '%');
-function statusText(cap, accounts, auto) {
-    const lead = auto ? '$(sync) ' : '';
+function statusText(cap, accounts, auto, busy = false) {
+    const lead = busy ? '$(refresh~spin) ' : auto ? '$(sync) ' : '';
     if (!cap.you) return lead + '● none';
     const me = accounts.find((a) => isClaude(a) && a.label === cap.you) || {};
     return `${lead}● ${cap.you} ${pctOr(me.five_pct)}/${pctOr(me.week_pct)}${cap.activeFresh ? '' : ' ◷'} · ⇄ ${cap.best ? cap.best.label : 'none'}`;
 }
 
-// Tooltip: the auto-switch state, then one line per account (an active account with no row gets one too).
+// Tooltip (a MarkdownString, shown on hover): the active account with a refresh link, its 5h and weekly bars with percent
+// and reset times, and one auto-switch line with a toggle link. Stale data keeps its age ('data 45m old').
+// The tooltip is trusted for two commands, so every label from data must stay inert. A saved or team label passes
+// isLabel; the fallback (an email's local part) is escaped: no html, no $(icon), no markdown link, bracket or backtick.
+const mdSafe = (l) => (isLabel(l) ? l : String(l).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[\\`*_{}\[\]()#+\-.!|~$]/g, '\\$&'));
+const HIGH = 80;  // the panel's threshold: orange from here up
+const BAR_CELLS = 10;
+// VS Code allows only color and background-color in a span, hence the inline style. Blue and orange read on dark and light.
+const bar = (pct) => {
+    const n = Math.max(0, Math.min(BAR_CELLS, Math.round(pct / 100 * BAR_CELLS)));
+    const col = pct >= HIGH ? '#e8590c' : '#3794ff';
+    return (n ? `<span style="color:${col};">${'█'.repeat(n)}</span>` : '') + (n < BAR_CELLS ? `<span style="color:#8a8a8a;">${'░'.repeat(BAR_CELLS - n)}</span>` : '');
+};
+const NB = '&nbsp;';
+const REFRESH = '[$(refresh)](command:claudeUsage.refresh "Refresh usage now")';
 function statusTooltip(cap, accounts, auto, now = Date.now() / 1000) {
-    const list = cap.you && !accounts.some((a) => isClaude(a) && a.label === cap.you) ? [...accounts, { label: cap.you, fetched_at: null, state: 'no data yet' }] : accounts;
-    const dead = new Set(cap.relogin || []);
-    const lines = list.map((a) => {
-        const age = isFresh(a, now) ? null : ageText(a.fetched_at, now), claude = isClaude(a);
-        return `${a.label}: 5h ${pctOr(a.five_pct)}, wk ${pctOr(a.week_pct)}` + (claude && dead.has(a.label) ? ' · re-login' : '')
-            + (age === 'no data' ? ' · no data' : age ? ` · data ${age}` : !isFresh(a, now) ? ` · ${a.state}` : '')
-            + (!claude ? ' · ' + TIPS.readonly : a.label === cap.you ? ' · active' : '');
-    });
-    return [`Auto-switch: ${auto ? 'ON' : 'off'}`, ...lines].join('\n');
+    const me = cap.you && accounts.find((a) => isClaude(a) && a.label === cap.you);
+    const lines = [(cap.you ? `**${mdSafe(cap.you)}**` : 'No active account') + NB + NB + REFRESH];
+    if (cap.you) {
+        const age = me && !isFresh(me, now) ? ageText(me.fetched_at, now) || me.state : me ? null : 'no data';
+        const live = (epoch) => epoch && epoch > now - 60;
+        // The bar comes first on each row, so both bars start at the left edge: the hover font is proportional, so a
+        // label before the bar would push it to a different x. An unknown percent gets an empty bar and a dash.
+        const row = (name, pct, epoch, extra) => bar(pct == null ? 0 : pct) + NB + NB + `${name} ${pctOr(pct)}`
+            + (live(epoch) ? ' · resets ' + resetText(epoch) : '') + extra;
+        const mark = (new Set(cap.relogin || [])).has(cap.you) ? ' · re-login' : age === 'no data' ? ' · no data' : age ? ` · data ${age}` : '';
+        lines.push(row('5h', me && me.five_pct, me && me.five_reset_epoch, mark), row('Weekly', me && me.week_pct, me && me.week_reset_epoch, ''));
+    }
+    const next = cap.best ? mdSafe(cap.best.label) : null;
+    lines.push(auto
+        ? `$(sync) Auto-switch on → ${next || 'none'}${NB}${NB}[$(debug-pause)](command:claudeUsage.toggleAutoSwitch "Turn auto-switch off")`
+        : `$(circle-slash) Auto-switch off${next ? ' · next ' + next : ''}${NB}${NB}[$(play)](command:claudeUsage.toggleAutoSwitch "Turn auto-switch on")`);
+    const md = new vscode.MarkdownString(lines.join('\n\n'), true);
+    md.supportHtml = true;
+    md.isTrusted = { enabledCommands: ['claudeUsage.refresh', 'claudeUsage.toggleAutoSwitch'] };
+    return md;
 }
 
 // Data age as shown on a row: null while fresh by time, 'no data' when there never was any, 'in the future' past the
@@ -306,9 +351,9 @@ function panelData(accounts, cap, { now, installed, auto, team = false, histRang
 
 // Turning auto-switch ON switches accounts with nobody watching, so it asks in a modal and records the yes in
 // globalState (state); auto-switch never acts without it. OFF needs no dialog. Returns true when the setting changed.
-const AUTO_DETAIL = 'Auto-switch changes the Claude Code account for every new Claude Code session on this machine, without asking, '
+const AUTO_DETAIL = 'Auto-switch changes the Claude Code account for every Claude Code session on this machine, without asking, '
     + 'when the active account reaches 100% (5h or weekly). If it is already at 100%, it switches right away. '
-    + 'Open Claude Code tabs keep the old account until you restart them.';
+    + 'Open Claude Code tabs use the new account from their next message.';
 const CONSENT = 'claudeUsage.autoSwitchConsent';
 async function askAutoConsent(state) {
     const ok = await vscode.window.showWarningMessage('Turn on auto-switch?', { modal: true, detail: AUTO_DETAIL }, 'Turn on') === 'Turn on';
@@ -362,17 +407,17 @@ async function switchSeat(label, onDone) {
     if (relogin.has(label) || !saved(label)) return enroll(label, relogin.has(label));
 
     const ok = await vscode.window.showWarningMessage(`Switch Claude Code to ${label}?`,
-        { modal: true, detail: 'Instant, using your saved login (ccswitch). New Claude Code sessions use it; restart open Claude Code tabs to move them over.' },
+        { modal: true, detail: 'Instant, using your saved login (ccswitch). Open and new Claude Code sessions use it from their next message.' },
         'Switch');
     if (ok !== 'Switch') return;
     const r = await ccswitch([label]);
     if (!r.ok) { vscode.window.showErrorMessage('ccswitch failed: ' + r.msg); return; }
     onDone();
-    vscode.window.showInformationMessage(`Switched Claude Code to ${label}. Restart open Claude Code tabs to use it.`);
+    vscode.window.showInformationMessage(`Switched Claude Code to ${label}. Open Claude Code tabs use it from their next message.`);
 }
 
 // ccswitch's reserved words (RESERVED_WORDS in the ccswitch script): a label may not be one of them.
-const RESERVED = ['save', 'delete', 'list', 'usage', 'help', 'version', 'refresh-pause', 'refresh-resume', 'add'];
+const RESERVED = ['save', 'delete', 'list', 'usage', 'help', 'version', 'refresh-pause', 'refresh-resume', 'add', 'schedule'];
 // The input box's check of a new label: null when fine, else the text (or a warning) to show under the box.
 function labelProblem(v) {
     if (!isLabel(v)) return 'Use letters, digits, _ and - only, and do not start with -.';
@@ -613,7 +658,7 @@ async function autoSwitch(cap, state, onDone) {
     if (!res.r) return res;
     if (!res.r.ok) { vscode.window.showErrorMessage(`Auto-switch to ${res.to} failed: ` + res.r.msg); return res; }
     onDone();
-    const next = await vscode.window.showWarningMessage(`Auto-switched Claude Code: ${res.from} is full, now on ${res.to} (most headroom). Restart open Claude Code tabs to use it.`, 'Turn auto-switch off');
+    const next = await vscode.window.showWarningMessage(`Auto-switched Claude Code: ${res.from} is full, now on ${res.to} (most headroom). Open Claude Code tabs use it from their next message.`, 'Turn auto-switch off');
     if (next === 'Turn auto-switch off') changeAutoSwitch(false);
     return res;
 }
@@ -644,10 +689,35 @@ function removeOldHelper() {
     }
 }
 
+// "Keep history when VS Code is closed": `ccswitch schedule` (1.3.0+) keeps one cron line that samples usage while VS Code is
+// closed. State comes from `schedule status --json`: null = hide the toggle (team file, no ccswitch, no crontab on this machine),
+// { old: true } = ccswitch too old (the toggle shows; a click offers the update, like Add account), else { on, every }.
+async function ccswitchHasSchedule() {
+    const r = await run(CCSWITCH, ['version']);
+    const m = /(\d+)\.(\d+)\.(\d+)/.exec(r.out);
+    return r.ok && !!m && (+m[1] > 1 || (+m[1] === 1 && +m[2] >= 3));
+}
+async function scheduleRead() {
+    if (usageFile() || !fs.existsSync(CCSWITCH)) return null;
+    if (!(await ccswitchHasSchedule())) return { old: true, on: false, every: null };
+    const r = await run(CCSWITCH, ['schedule', 'status', '--json']);
+    if (!r.ok) return null;
+    try { const j = JSON.parse(r.out); return { on: j.on === true, every: Number.isInteger(j.every) ? j.every : null }; } catch { return null; }
+}
+// Turning it ON adds a cron job that runs with nobody watching, so it asks in a modal, every time. OFF needs no dialog.
+const SCHEDULE_DETAIL = 'This adds a cron job that fetches usage for all accounts every 10 minutes, even with VS Code closed.';
+async function scheduleChange(on) {
+    if (!(await ccswitchHasSchedule())) return installCcswitch('Keeping history while VS Code is closed needs ccswitch 1.3.0 or newer (`ccswitch schedule`). The installed one is older, and this installer updates it.');
+    if (on && await vscode.window.showWarningMessage('Keep history when VS Code is closed?', { modal: true, detail: SCHEDULE_DETAIL }, 'Turn on') !== 'Turn on') return;
+    const r = await run(CCSWITCH, ['schedule', on ? 'on' : 'off']);
+    if (!r.ok) vscode.window.showErrorMessage('Could not turn background history ' + (on ? 'on' : 'off') + ': ' + (r.err.trim() || r.msg));
+}
+
 function activate(context) {
     removeOldHelper();
     let view = null;
     let accounts = [], cap = null;
+    let schedule = null;  // scheduleRead(): what the Automation toggle "Keep history when VS Code is closed" shows
     const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     status.command = 'workbench.view.extension.claudeUsage';
     status.text = '$(pulse) Claude …';
@@ -659,15 +729,18 @@ function activate(context) {
     const push = () => {
         if (!view || !cap) return;
         const now = Date.now() / 1000, want = (l) => historyOn || l === cap.you;
-        view.webview.postMessage(panelData(view.visible ? withHistory(accounts, want, now) : accounts, cap,
-            { now, installed: fs.existsSync(CCSWITCH), auto: !!cap.auto, team: !!usageFile(), histRange, historyOn }));
+        view.webview.postMessage({ ...panelData(view.visible ? withHistory(accounts, want, now) : accounts, cap,
+            { now, installed: fs.existsSync(CCSWITCH), auto: !!cap.auto, team: !!usageFile(), histRange, historyOn }), schedule });
     };
+    const readSchedule = () => scheduleRead().then((s) => { schedule = s; push(); });
+    const toggleSchedule = () => scheduleChange(!(schedule && schedule.on)).then(readSchedule);
     const autoOn = () => vscode.workspace.getConfiguration('claudeUsage').get('autoSwitch');
     const toggleAuto = () => changeAutoSwitch(!autoOn(), context.globalState);
 
+    let busy = false;  // a fetch runs: the status bar icon spins, as the panel's reload icon does
     const poll = () => {
         try { ({ accounts, cap } = readAccounts()); cap.auto = autoOn(); } catch (err) { status.text = '$(warning) Claude usage unreadable'; status.tooltip = String(err); return; }
-        status.text = statusText(cap, accounts, cap.auto);
+        status.text = statusText(cap, accounts, cap.auto, busy);
         status.tooltip = statusTooltip(cap, accounts, cap.auto);
         push();
         autoSwitch(cap, context.globalState, poll);
@@ -675,7 +748,7 @@ function activate(context) {
 
     // The fetch (timed, from the button or the command). The panel spins from start to end; a request while one runs is dropped.
     const post = (m) => view && view.webview.postMessage(m);
-    onBusy = (on) => post({ kind: 'busy', on });
+    onBusy = (on) => { busy = on; if (cap) status.text = statusText(cap, accounts, cap.auto, busy); post({ kind: 'busy', on }); };
     const health = (manual) => { if (!inflight) fetchLogins(manual === true).then(poll); };
     const manualHealth = () => health(true);
     // An Add account terminal closed: say so when ccswitch saved a new snapshot, show the row now, then fetch its
@@ -707,13 +780,14 @@ function activate(context) {
                 v.webview.html = webviewHtml(v.webview);
                 v.webview.onDidReceiveMessage((m) => {
                     if (!m) return;
-                    if (m === 'ready') { push(); if (inflight) post({ kind: 'busy', on: true }); }
+                    if (m === 'ready') { push(); readSchedule(); if (inflight) post({ kind: 'busy', on: true }); }
                     else if (m.refresh) manualHealth();
                     else if (m.seat) switchSeat(m.seat, poll);
                     else if (m.add) addAccount();
                     else if (m.save) saveSeat(m.save, poll);
                     else if (m.del) deleteSeat(m.del, poll);
                     else if (m.toggleAuto) toggleAuto();
+                    else if (m.toggleSchedule) toggleSchedule();
                     else if (m.installCc) installCcswitch();
                     else if (m.wantStats) { if (v.visible) wantStats(); }  // a hidden, retained Stats tab never rebuilds
                     else if (m.wantHistory !== undefined || m.histRange !== undefined) {
@@ -758,4 +832,4 @@ ${esc.toString()}
 ${read('panel.js')}</script></body></html>`;
 }
 
-module.exports = { activate };
+module.exports = { activate, scheduleRead, scheduleChange, SCHEDULE_DETAIL };
